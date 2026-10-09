@@ -1,0 +1,18 @@
+# Normalize line endings to LF for all text files in the repo.
+* text=auto eol=lf
+
+# Explicitly treat these as text with LF endings.
+*.py   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+*.cfg  text eol=lf
+*.txt  text eol=lf
+
+# Binary types (never normalize) -- defensive, though data/weights are gitignored.
+*.parquet     binary
+*.safetensors binary
+*.npy         binary
+*.zip         binary
+*.tgz         binary
+*.pem         binary

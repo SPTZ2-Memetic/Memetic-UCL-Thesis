@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Memetic Code Repair: Evolving Debugging Knowledge through Self-Play"
+type: software
+authors:
+  - name: "Anonymous"
+year: 2026
+url: "https://github.com/SPTZ2-Memetic/Memetic-UCL-Thesis"
+license: MIT
+references:
+  - type: thesis
+    title: "Memetic Code Repair: Evolving Debugging Knowledge through Self-Play"
+    authors:
+      - name: "Anonymous"
+    thesis-type: "Master's thesis"
+    institution:
+      name: "University College London"
+    year: 2026

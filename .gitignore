@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Secrets / credentials -- never commit
+.env
+secrets/
+*.pem
+
+# Data, model weights, archives -- not distributed with the repo
+asp_datasets/
+code-embedder/
+code-embedder-1024/
+minilm/
+*.zip
+*.tgz
+*.parquet
+*.safetensors
+*.npy
+
+# Run artifacts / logs
+runs/
+*.log
+*.jsonl
