@@ -1,350 +1,430 @@
-﻿#!/usr/bin/env python
-"""
-probe_stage_ablation.py -- E4 RETRIEVAL-STAGE ablation for the GENERATOR's
-skill-applicability pipeline.
+﻿#!/usr/bin/env python3
+"""Bounded E4 generator retrieval-stage ablation for MEMETIC.
 
-The generator decides which stored bug-mechanism skills apply to a clean
-canonical through three stages:
+Production-comparable arms (each sends <= B site/skill pairs to the same judge):
+  full           structural filter -> MiniLM top-B -> LLM applicability judge
+  struct_randcap structural filter -> seeded random B -> same judge
+  embed_llm      full site x skill cross-product -> MiniLM top-B -> same judge
 
-    Stage A  structural routing   match_sites_to_skills      (deterministic)
-    pre-rank embedding ranker     rank_candidates_by_embedding (MiniLM, cheap)
-    Stage B  applicability judge   judge_skill_applicability   (LLM, expensive)
+Extra random audits estimate the applicability missed by (1) the capped
+structurally-eligible population and (2) structural filtering itself.
+The exact judge applies to ALL selected/audited pairs. The audit provides
+statistical estimates, NOT ground-truth semantic applicability. No bugs are
+generated or repaired here; this measures retrieval selection, not fixer gain.
 
-This probe asks whether each pre-filter stage earns its place, measured as
-applicability RECALL / PRECISION against JUDGE COST (the only expensive stage).
-It is a RETRIEVAL/judging experiment: no bug generation, no fixer solve loop.
-
-CONFIGS (what pre-filters precede the Stage-B judge):
-  struct_llm      Stage A -> judge EVERY structural survivor (no cap).
-                  The thorough, tractable REFERENCE applicable set.
-  full            Stage A -> embedding-rank -> top-B -> judge. Production.
-  struct_randcap  Stage A -> RANDOM cap to B -> judge. Embedding OFF at the
-                  same budget as `full` -> isolates the EMBEDDING ranker.
-  embed_llm       NO structure: embed the full site x skill cross-product ->
-                  top-B -> judge. Isolates the STRUCTURAL router.
-  llm_only        NO structure, NO embedding: judge the whole cross-product.
-                  The exhaustive gold; ~sites x |bank| judge calls/canonical,
-                  so OFF by default and meant for a capped pool / small sample.
-
-DESIGN DECISIONS (see the thesis write-up):
-  * Reference defaults to `struct_llm`, not `llm_only`: a literal judge-
-    everything arm over a 386-skill bank is tens of thousands of gpt-5-mini
-    calls. Judging every structural survivor is the most complete labelling
-    that is tractable. Enable `llm_only` (capped pool) only to test whether
-    structural routing itself discards applicable pairs.
-  * A verdict CACHE keyed on (task, site, skill) judges each unique pair once
-    and shares the verdict across arms: this removes judge stochasticity as a
-    confound (arms differ only by WHICH pairs they send) and cuts cost. The
-    per-arm COST reported is "pairs sent" (production cost), not LLM calls made.
-  * Judge model defaults to gpt-5-mini (the deployed Stage-B judge).
-  * Budget B defaults to 40 (the methodology's judge_budget).
-  * Leakage: canonicals from bigcodebench_ours train, minus --exclude-tasks.
-
-EXAMPLE
-  set -a; source .env; set +a
-  python scripts/probe_stage_ablation.py \
-    --bank runs/selfplay_thesis/skillbank.json \
-    --exclude-tasks runs/selfplay_thesis/skillbank.json.task_ids.json \
-    --n-canonicals 80 --judge-budget 40 --judge-model gpt-5-mini \
-    --workers 6 --out runs/e4_stage_ablation.txt
+Results: .txt report, .jsonl per-canonical rows, .pairs.jsonl paired verdict
+trace, .sqlite persistent verdict cache, .tasks.json reproducible task manifest.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import random
+import sqlite3
 import sys
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 
-from memetic.loader import load_seed_pool                       # noqa: E402
-from memetic.seed import reconstruct_function                   # production canonical builder
-try:                                                                # noqa: E402
-    from memetic.loop import record_is_runnable                 # matches probe_skill_matching
-except Exception:                                                   # pragma: no cover
-    try:
-        from memetic.loop_v2 import record_is_runnable
-    except Exception:
-        def record_is_runnable(_rec):  # fallback: do not filter
-            return True
-from memetic.matching import (                                  # noqa: E402
-    match_sites_to_skills, rank_candidates_by_embedding, CandidatePair)
-from memetic.sites import extract_meaningful_sites              # noqa: E402
-from memetic.skills import SEED_SKILLS                          # noqa: E402
-from memetic.skill_bank import SkillBank                        # noqa: E402
-from memetic.judge_skill import judge_skill_applicability       # noqa: E402
-from memetic.embeddings import Embedder                         # noqa: E402
+try:
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
 
-ALL_CONFIGS = ("struct_llm", "full", "struct_randcap", "embed_llm", "llm_only")
+from memetic.loader import load_seed_pool
+from memetic.seed import reconstruct_function
+try:
+    from memetic.loop import record_is_runnable
+except ImportError:
+    from memetic.loop_v2 import record_is_runnable
+from memetic.matching import match_sites_to_skills, rank_candidates_by_embedding, CandidatePair
+from memetic.sites import extract_meaningful_sites
+from memetic.skill_bank import SkillBank
+from memetic.judge_skill import judge_skill_applicability
+from memetic.embeddings import Embedder
+
+ARMS = ("full", "struct_randcap", "embed_llm")
 
 
-# --------------------------------------------------------------------------- #
-#  plumbing (mirrors scripts/probe_skill_matching.py)                         #
-# --------------------------------------------------------------------------- #
-def build_policy(model, temperature=0.3, max_tokens=300):
-    """Route each model to its provider. gpt* -> OpenAI (OPENAI_API_KEY),
-    qwen* -> a Qwen host (QWEN_API_KEY, default Together), else a generic
-    OpenAI-compatible gateway. Public providers verify TLS against the system
-    CA bundle (ca_cert=True); only the gateway fallback uses a custom cert."""
+def digest(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def file_digest(path):
+    p = Path(path)
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else "missing"
+
+
+def normalize_task_id(task_id):
+    return str(task_id).strip().lower().replace("/", "_")
+
+
+def read_exclusions(path):
+    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(obj, dict):
+        ids = [v for val in obj.values() for v in (val if isinstance(val, list) else [val])]
+    elif isinstance(obj, list):
+        ids = obj
+    else:
+        raise ValueError("Exclude manifest must be a list of task IDs or a dict of source -> ID lists")
+    return {normalize_task_id(t) for t in ids}
+
+
+def get_policy(model):
     try:
         from memetic.prometheus_policy import PrometheusPolicy
-    except Exception:
+    except ImportError:
         from memetic.policy_prometheus import PrometheusPolicy
-    m = (model or "").lower()
-    if m.startswith("gpt"):
+
+    api_base = os.environ.get("LLM_API_BASE", "").strip()
+    if api_base:
+        # Use the same max-token limit and temperature as the previous probe;
+        # changing these would change the judge rather than only retrieval.
         return PrometheusPolicy(
-            model=model,
-            api_base=os.environ.get("OPENAI_API_BASE", "https://api.openai.com"),
-            ca_cert=True, api_key_env="OPENAI_API_KEY",
-            temperature=temperature, max_tokens=max_tokens)
-    if m.startswith("qwen"):
-        return PrometheusPolicy(
-            model=os.environ.get("QWEN_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct"),
-            api_base=os.environ.get("QWEN_API_BASE", "https://api.together.xyz"),
-            ca_cert=True, api_key_env="QWEN_API_KEY",
-            temperature=temperature, max_tokens=max_tokens)
-    return PrometheusPolicy(
-        model=model,
-        api_base=os.environ.get("GATEWAY_API_BASE", "https://your-gateway.example.com"),
-        ca_cert=os.environ.get("GATEWAY_CA_CERT", "secrets/gateway-ca.pem"),
-        temperature=temperature, max_tokens=max_tokens)
+            model=model, api_base=api_base, ca_cert=True,
+            api_key_env=os.environ.get("LLM_API_KEY_ENV", "LLM_API_KEY"),
+            temperature=0.3, max_tokens=8000,
+            timeout_seconds=float(os.environ.get("LLM_TIMEOUT_SECONDS", "300")))
+    if model.startswith("gpt"):
+        return PrometheusPolicy(model=model,
+                                api_base=os.environ.get("OPENAI_API_BASE", "https://api.openai.com"),
+                                ca_cert=True, api_key_env="OPENAI_API_KEY",
+                                temperature=0.3, max_tokens=8000)
+    raise RuntimeError("Set LLM_API_BASE and LLM_API_KEY_ENV for this judge provider")
 
 
-def normalize_task_id(tid: str) -> str:
-    return tid.strip().lower().replace("/", "_")
-
-
-def load_excluded(path: str) -> set:
-    if not path:
-        return set()
-    with open(path, "r", encoding="utf-8") as f:
-        by_source = json.load(f)
-    return {normalize_task_id(t) for ids in by_source.values() for t in ids}
-
-
-def load_skills(args):
-    if args.bank:
-        bank = SkillBank.load(args.bank)
-        skills = bank.all()
-        print(f"loaded {len(skills)} distilled skills <- {args.bank}", flush=True)
-    else:
-        skills = list(SEED_SKILLS)
-        print(f"--bank not given; falling back to {len(skills)} SEED_SKILLS", flush=True)
-    # Optional pool cap: only relevant when `llm_only` is enabled (the
-    # exhaustive arm is ~sites x |pool| judge calls). ALL arms share the
-    # capped pool so the comparison stays fair.
-    if args.skill_pool_cap and len(skills) > args.skill_pool_cap:
-        rng = random.Random(args.seed)
-        skills = rng.sample(skills, args.skill_pool_cap)
-        print(f"capped skill pool to {len(skills)} (--skill-pool-cap, shared by all arms)",
-              flush=True)
-    return skills
-
-
-# --------------------------------------------------------------------------- #
-#  keys + candidate construction                                              #
-# --------------------------------------------------------------------------- #
 def site_key(site):
-    return (getattr(site, "lineno", None), (getattr(site, "source_text", "") or "")[:160])
+    # Same source and location => same logical site across constructors.
+    return (getattr(site, "lineno", None),
+            getattr(site, "col_offset", None),
+            getattr(site, "end_lineno", None),
+            (getattr(site, "source_text", "") or "")[:160])
 
 
-def pair_key(task_id, p):
-    return (task_id, p.skill.skill_id, site_key(p.site))
+def pair_id(pair):
+    return (str(pair.skill.skill_id), site_key(pair.site))
 
 
-def cross_pairs(canonical, skills, max_sites):
-    sites = extract_meaningful_sites(canonical, max_sites=max_sites)
-    return [CandidatePair(site=s, skill=k) for s in sites for k in skills]
+def dedupe(pairs):
+    result = {}
+    for pair in pairs:
+        result[pair_id(pair)] = pair
+    return result
 
 
-def random_cap(pairs, b, seed):
-    if len(pairs) <= b:
-        return list(pairs)
-    return random.Random(seed).sample(list(pairs), b)
+def skill_fingerprint(skill):
+    try:
+        contents = json.dumps(vars(skill), sort_keys=True, default=str, ensure_ascii=False)
+    except TypeError:
+        contents = repr(skill)
+    return digest(contents)
 
 
-def config_pairs(cfg, canonical, skills, embedder, b, max_sites, seed):
-    """The (site, skill) pairs a given config would SEND to the Stage-B judge."""
-    if cfg in ("struct_llm", "full", "struct_randcap"):
-        survivors = match_sites_to_skills(canonical, skills, max_sites=max_sites)
-        if cfg == "struct_llm":
-            return survivors
-        if cfg == "full":
-            return rank_candidates_by_embedding(survivors, embedder, top_k=b)
-        return random_cap(survivors, b, seed)           # struct_randcap
-    cross = cross_pairs(canonical, skills, max_sites)
-    if cfg == "embed_llm":
-        return rank_candidates_by_embedding(cross, embedder, top_k=b)
-    return cross                                         # llm_only
+def verdict_cache_key(task_id, canonical, pair, model, version, judge_code_sha):
+    # Include model, endpoint, source, prompt revision and skill contents.
+    fields = [version, model, os.environ.get("LLM_API_BASE", ""), judge_code_sha,
+              task_id, digest(canonical), str(pair.skill.skill_id),
+              skill_fingerprint(pair.skill), site_key(pair.site)]
+    return digest(json.dumps(fields, sort_keys=True, default=str, ensure_ascii=False))
 
 
-# --------------------------------------------------------------------------- #
-#  main                                                                       #
-# --------------------------------------------------------------------------- #
+def sample_pairs(pairs_by_key, n, rng):
+    keys = sorted(pairs_by_key.keys(), key=str)
+    if n >= len(keys):
+        return dict(pairs_by_key)
+    return {k: pairs_by_key[k] for k in rng.sample(keys, n)}
+
+
+def load_task_pool(args):
+    """Prefer exclusion-filtered train; otherwise use disjoint 'test' split.
+
+    We do NOT silently call an unfiltered train pool 'held-out'.
+    """
+    manifest = args.exclude_tasks or (args.bank + ".task_ids.json")
+    if args.split == "auto":
+        split = "train" if Path(manifest).exists() else "test"
+    else:
+        split = args.split
+    if split == "train":
+        if not Path(manifest).exists() and not args.allow_overlap:
+            raise SystemExit(
+                "Train split requested but no skill-provenance manifest found: " + manifest +
+                "\nProvide --exclude-tasks PATH, use --split test, or use --allow-overlap "
+                "ONLY for a non-held-out diagnostic.")
+        excluded = read_exclusions(manifest) if Path(manifest).exists() else set()
+        print(f"split=train; excluded {len(excluded)} tasks using {manifest if excluded else 'NONE (OVERLAP RISK)'}", flush=True)
+    else:
+        excluded = set()
+        print("split=test (independent of train-bank construction, subject to dataset provenance)", flush=True)
+    try:
+        raw = load_seed_pool(split, limit=None if args.pool_limit <= 0 else args.pool_limit)
+    except Exception as exc:
+        raise SystemExit(f"Unable to load {split!r} split: {exc}. Provide a train task provenance manifest if needed.")
+    # Unique task IDs: a benchmark may contain several bugs for the same canonical.
+    unique = {}
+    for rec in raw:
+        tid = normalize_task_id(rec["task_id"])
+        if tid in excluded or tid in unique or not record_is_runnable(rec):
+            continue
+        unique[tid] = rec
+    pool = list(unique.values())
+    if not pool:
+        raise SystemExit(f"No eligible runnable canonicals in split={split} after exclusions.")
+    rng = random.Random(args.seed)
+    chosen = rng.sample(pool, min(args.n_canonicals, len(pool)))
+    print(f"eligible unique canonicals={len(pool)}; sampled={len(chosen)} seed={args.seed}", flush=True)
+    return chosen, split, manifest if split == "train" and excluded else None
+
+
+def open_cache(path):
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS verdicts (k TEXT PRIMARY KEY, applicable INTEGER NOT NULL, created REAL NOT NULL)")
+    conn.commit()
+    return conn
+
+
+def bootstrap_paired(rows, a, b, samples=2000, seed=123):
+    vals = [r["arms"][a]["applicable"] - r["arms"][b]["applicable"] for r in rows]
+    n = len(vals)
+    avg = sum(vals) / n
+    if n == 1:
+        return avg, None, None
+    rng = random.Random(seed)
+    boots = sorted(sum(vals[rng.randrange(n)] for _ in range(n))/n for _ in range(samples))
+    return avg, boots[int(.025 * samples)], boots[int(.975 * samples)]
+
+
+def sample_estimate(N, n, hits):
+    """Expansion estimator and SRS without replacement variance for binary labels."""
+    if N == 0:
+        return 0.0, 0.0
+    if n == 0:
+        raise ValueError("Audit size zero for a nonempty sampling stratum")
+    p = hits / n
+    total = N * p
+    if n == N:
+        return float(hits), 0.0
+    if n <= 1:
+        return total, float("nan")
+    variance = (N ** 2) * (1 - n / N) * p * (1 - p) / (n - 1)
+    return total, variance
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bank", default="runs/selfplay_thesis/skillbank.json",
-                    help="distilled generator SkillBank json")
-    ap.add_argument("--exclude-tasks", default="",
-                    help="json manifest of task_ids the bank was distilled from "
-                         "(namespace-normalised and removed from the canonical pool)")
-    ap.add_argument("--pool-limit", type=int, default=0,
-                    help="rows to read from the clean train pool (0 = all); "
-                         "canonicals are sampled from these")
-    ap.add_argument("--n-canonicals", type=int, default=80)
-    ap.add_argument("--judge-model", default="gpt-5-mini")
-    ap.add_argument("--judge-budget", type=int, default=40,
-                    help="B: judge cap for full / struct_randcap / embed_llm")
-    ap.add_argument("--max-sites", type=int, default=0,
-                    help="cap meaningful sites per canonical (0 = no cap); "
-                         "mainly bounds the llm_only cross-product")
-    ap.add_argument("--arms", default="struct_llm,full,struct_randcap,embed_llm",
-                    help="comma list from: " + ",".join(ALL_CONFIGS))
-    ap.add_argument("--reference", default="auto",
-                    help="config whose applicable set defines recall; "
-                         "'auto' = llm_only if enabled else struct_llm")
-    ap.add_argument("--skill-pool-cap", type=int, default=0,
-                    help="cap the shared skill pool (recommended only with llm_only)")
-    ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default="runs/e4_stage_ablation.txt")
-    args = ap.parse_args()
-
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
-    for a in arms:
-        if a not in ALL_CONFIGS:
-            raise SystemExit(f"unknown arm '{a}'; choose from {ALL_CONFIGS}")
-    ref = args.reference
-    if ref == "auto":
-        ref = "llm_only" if "llm_only" in arms else "struct_llm"
-    if ref not in arms:
-        raise SystemExit(f"--reference {ref} must be one of the enabled --arms {arms}")
-    max_sites = None if args.max_sites <= 0 else args.max_sites
-
-    print(f"arms={arms} | reference={ref} | B={args.judge_budget} | "
-          f"judge={args.judge_model} | workers={args.workers}", flush=True)
-    if "llm_only" in arms and not args.skill_pool_cap:
-        print("WARNING: llm_only enabled without --skill-pool-cap -- the "
-              "exhaustive arm judges sites x |bank| pairs per canonical.", flush=True)
-
-    skills = load_skills(args)
-    excluded = load_excluded(args.exclude_tasks)
-    if args.exclude_tasks:
-        print(f"excluding {len(excluded)} distillation task_ids <- {args.exclude_tasks}",
-              flush=True)
-    elif args.bank:
-        print("WARNING: --bank without --exclude-tasks: pool may contain "
-              "canonicals the bank was distilled from (recall, not generalisation).",
-              flush=True)
-
-    pool_limit = None if args.pool_limit <= 0 else args.pool_limit
-    raw = [s for s in load_seed_pool("train", limit=pool_limit) if record_is_runnable(s)]
-    canon = [s for s in raw if normalize_task_id(s["task_id"]) not in excluded]
-    canon = canon[:args.n_canonicals]
-    print(f"{len(raw)} runnable canonicals, {len(canon)} after exclusion/sampling\n",
-          flush=True)
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bank", default="scripts/skillbank.json")
+    parser.add_argument("--exclude-tasks", default="")
+    parser.add_argument("--split", choices=("auto", "train", "test"), default="auto")
+    parser.add_argument("--allow-overlap", action="store_true")
+    parser.add_argument("--pool-limit", type=int, default=0)
+    parser.add_argument("--n-canonicals", type=int, default=30)
+    parser.add_argument("--judge-budget", type=int, default=40)
+    parser.add_argument("--audit-struct", type=int, default=10,
+                        help="sample structurally eligible pairs not selected by any arm")
+    parser.add_argument("--audit-rejected", type=int, default=10,
+                        help="sample structurally rejected pairs not selected by any arm")
+    parser.add_argument("--judge-model", default="openai/gpt-5-mini")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-sites", type=int, default=0, help="0=no cap, as production")
+    parser.add_argument("--cache-version", default="v1", help="increment after changing any hidden judge prompts")
+    parser.add_argument("--out", default="runs/e4_stage_ablation_final.txt")
+    args = parser.parse_args()
+    if min(args.judge_budget, args.audit_struct, args.audit_rejected, args.n_canonicals, args.workers) < 0 or args.judge_budget == 0 or args.workers == 0 or args.n_canonicals == 0:
+        parser.error("n-canonicals, workers, and judge-budget must be positive; audit sizes must be nonnegative")
+    if args.audit_struct == 0 or args.audit_rejected == 0:
+        parser.error("Final design requires both audits > 0 to estimate missed applicability")
+    if not Path(args.bank).exists():
+        raise SystemExit(f"SkillBank not found: {args.bank}")
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    judge_file = ROOT / "src" / "memetic" / "judge_skill.py"
+    judge_sha = file_digest(judge_file)
+    skills = SkillBank.load(args.bank).all()
+    print(f"SkillBank={args.bank} | skills={len(skills)} | B={args.judge_budget} | judge={args.judge_model}", flush=True)
+    canonicals, split, manifest = load_task_pool(args)
+    (Path(str(out_path) + ".tasks.json")).write_text(json.dumps({
+        "task_ids": [r["task_id"] for r in canonicals],
+        "split": split, "excluded_manifest": manifest,
+        "bank_sha256": file_digest(args.bank), "judge_sha256": judge_sha,
+        "model": args.judge_model, "B": args.judge_budget,
+        "audit_struct": args.audit_struct, "audit_rejected": args.audit_rejected,
+        "seed": args.seed, "max_sites": args.max_sites,
+    }, indent=2), encoding="utf-8")
+    policy = get_policy(args.judge_model)
     embedder = Embedder()
-    policy = build_policy(args.judge_model)
-
-    # per-arm accumulators
-    agg = {a: {"sent": 0, "applicable": 0, "ref_hit": 0, "appl_skills": 0} for a in arms}
-    ref_total = 0
-    trace_path = args.out + ".jsonl"
-    t0 = time.time()
-
-    with open(trace_path, "w", encoding="utf-8") as tf:
-        for i, rec in enumerate(canon):
-            task_id = rec["task_id"]
-            canonical = reconstruct_function(rec, "canonical_solution")  # exact production input
-
-            # 1) build each arm's sent-pairs (deterministic given --seed)
-            per_arm = {a: config_pairs(a, canonical, skills, embedder,
-                                       args.judge_budget, max_sites, args.seed)
-                       for a in arms}
-
-            # 2) judge the UNION once, cache by pair key (no judge noise across arms)
-            cache = {}
-            union = {}
-            for a in arms:
-                for p in per_arm[a]:
-                    union[pair_key(task_id, p)] = (canonical, p)
-
-            def work(item):
-                k, (c, p) = item
-                v = judge_skill_applicability(c, p.site, p.skill, policy)
-                return k, bool(v.applicable)
-
-            with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-                for k, applic in ex.map(work, list(union.items())):
-                    cache[k] = applic
-
-            # 3) per-arm applicable sets + reference
-            arm_appl = {}
-            for a in arms:
-                keys = [pair_key(task_id, p) for p in per_arm[a]]
-                appl = {k for k in keys if cache.get(k)}
-                arm_appl[a] = appl
-                skills_appl = {k[1] for k in appl}  # distinct skill_ids judged applicable
-                agg[a]["sent"] += len(per_arm[a])
-                agg[a]["applicable"] += len(appl)
-                agg[a]["appl_skills"] += len(skills_appl)
-            ref_appl = arm_appl[ref]
-            ref_total += len(ref_appl)
-            for a in arms:
-                agg[a]["ref_hit"] += len(arm_appl[a] & ref_appl)
-
-            tf.write(json.dumps({
-                "i": i, "task_id": task_id,
-                "arms": {a: {"sent": len(per_arm[a]),
-                             "applicable": len(arm_appl[a]),
-                             "ref_recall_hit": len(arm_appl[a] & ref_appl)}
-                         for a in arms},
-                "ref": ref, "ref_applicable": len(ref_appl),
-            }) + "\n")
-            tf.flush()
-            print(f"  [{i+1}/{len(canon)}] {task_id}  "
-                  + "  ".join(f"{a}:{len(per_arm[a])}->{len(arm_appl[a])}" for a in arms),
-                  flush=True)
-
-    # ----------------------------------------------------------------- report
-    n = len(canon)
+    cache = open_cache(str(out_path) + ".sqlite")
+    rows = []
+    newly_judged = 0
+    cached_judged = 0
+    start = time.time()
+    try:
+        with open(str(out_path) + ".jsonl", "w", encoding="utf-8") as trace, \
+             open(str(out_path) + ".pairs.jsonl", "w", encoding="utf-8") as labels:
+            for i, rec in enumerate(canonicals):
+                task_id = str(rec["task_id"])
+                canonical = reconstruct_function(rec, "canonical_solution")
+                max_sites = None if args.max_sites <= 0 else args.max_sites
+                # Build every candidate once, and identify the structural set.
+                sites = extract_meaningful_sites(canonical, max_sites=max_sites)
+                universe = dedupe(CandidatePair(site=s, skill=k) for s in sites for k in skills)
+                structure = dedupe(match_sites_to_skills(canonical, skills, max_sites=max_sites))
+                if not set(structure).issubset(universe):
+                    raise RuntimeError(f"Structural matcher returned a site not in the cross-product: {task_id}. Check site keys.")
+                rng = random.Random(digest(f"{args.seed}/{task_id}"))
+                selected = {
+                    "full": dedupe(rank_candidates_by_embedding(list(structure.values()), embedder, top_k=args.judge_budget)),
+                    "struct_randcap": sample_pairs(structure, args.judge_budget, rng),
+                    "embed_llm": dedupe(rank_candidates_by_embedding(list(universe.values()), embedder, top_k=args.judge_budget)),
+                }
+                selected_union = set().union(*(set(v) for v in selected.values()))
+                unselected_struct = {k: v for k, v in structure.items() if k not in selected_union}
+                rejected = {k: v for k, v in universe.items() if k not in structure and k not in selected_union}
+                audit_eligible = sample_pairs(unselected_struct, args.audit_struct, rng)
+                audit_reject = sample_pairs(rejected, args.audit_rejected, rng)
+                judged = {}
+                for part in (*selected.values(), audit_eligible, audit_reject):
+                    judged.update(part)
+                key_by_pair = {
+                    pk: verdict_cache_key(task_id, canonical, pair, args.judge_model,
+                                          args.cache_version, judge_sha)
+                    for pk, pair in judged.items()
+                }
+                known = {}
+                missing = {}
+                for pk, pair in judged.items():
+                    cv = cache.execute("SELECT applicable FROM verdicts WHERE k=?", (key_by_pair[pk],)).fetchone()
+                    if cv is not None:
+                        known[pk] = bool(cv[0])
+                        cached_judged += 1
+                    else:
+                        missing[pk] = pair
+                print(f"[{i+1}/{len(canonicals)}] {task_id}: sites={len(sites)} universe={len(universe)} "
+                      f"struct={len(structure)} union={len(selected_union)} "
+                      f"audit={len(audit_eligible)}+{len(audit_reject)} "
+                      f"CACHED={len(known)} NEW_CALLS={len(missing)}", flush=True)
+                def judge_one(pk, pair):
+                    verdict = judge_skill_applicability(canonical, pair.site, pair.skill, policy)
+                    if not hasattr(verdict, "applicable"):
+                        raise RuntimeError(f"Judge did not return .applicable for task={task_id} pair={pk}")
+                    return pk, bool(verdict.applicable)
+                if missing:
+                    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+                        futures = {executor.submit(judge_one, pk, pair): pk for pk, pair in missing.items()}
+                        for future in as_completed(futures):
+                            pk, is_applicable = future.result()  # errors terminate; completed labels remain cached
+                            known[pk] = is_applicable
+                            cache.execute("INSERT OR REPLACE INTO verdicts (k,applicable,created) VALUES (?,?,?)",
+                                          (key_by_pair[pk], int(is_applicable), time.time()))
+                            cache.commit()
+                            newly_judged += 1
+                arm_stats = {}
+                for arm in ARMS:
+                    pool = selected[arm]
+                    applicable = sum(bool(known[pk]) for pk in pool)
+                    distinct = len({pk[0] for pk in pool if known[pk]})
+                    arm_stats[arm] = {"sent": len(pool), "applicable": applicable,
+                                      "precision": applicable/len(pool) if pool else None,
+                                      "applicable_skills": distinct}
+                known_struct_positives = sum(known[pk] for pk in judged if pk in structure and pk not in audit_eligible)
+                known_reject_positives = sum(known[pk] for pk in judged if pk not in structure and pk not in audit_reject)
+                audit_struct_hits = sum(known[pk] for pk in audit_eligible)
+                audit_reject_hits = sum(known[pk] for pk in audit_reject)
+                struct_est, struct_var = sample_estimate(len(unselected_struct), len(audit_eligible), audit_struct_hits)
+                reject_est, reject_var = sample_estimate(len(rejected), len(audit_reject), audit_reject_hits)
+                row = {
+                    "i": i, "task_id": task_id, "sites": len(sites),
+                    "universe_pairs": len(universe), "struct_pairs": len(structure),
+                    "unique_judged": len(judged), "arms": arm_stats,
+                    "audit": {
+                        "struct_omitted": {"population": len(unselected_struct), "sample": len(audit_eligible),
+                                           "positive": audit_struct_hits, "estimated_positive": struct_est, "estimated_variance": struct_var},
+                        "struct_rejected": {"population": len(rejected), "sample": len(audit_reject),
+                                            "positive": audit_reject_hits, "estimated_positive": reject_est, "estimated_variance": reject_var},
+                        "known_struct_positive": known_struct_positives,
+                        "known_rejected_positive": known_reject_positives,
+                        "estimated_struct_positive": known_struct_positives + struct_est,
+                        "estimated_total_positive": known_struct_positives + known_reject_positives + struct_est + reject_est,
+                    },
+                }
+                rows.append(row)
+                trace.write(json.dumps(row, default=str) + "\n")
+                trace.flush()
+                for pk in judged:
+                    labels.write(json.dumps({
+                        "task_id": task_id, "skill_id": pk[0], "site": pk[1],
+                        "selected_by": [arm for arm in ARMS if pk in selected[arm]],
+                        "audit_group": "struct_omitted" if pk in audit_eligible else (
+                            "struct_rejected" if pk in audit_reject else None),
+                        "applicable": bool(known[pk]), "cache_key": key_by_pair[pk],
+                    }, default=str) + "\n")
+                labels.flush()
+                print("    " + " | ".join(f"{a}: {v['applicable']}/{v['sent']}" for a, v in arm_stats.items()) +
+                      f" | audit omitted {audit_struct_hits}/{len(audit_eligible)}; rejected {audit_reject_hits}/{len(audit_reject)}", flush=True)
+    finally:
+        cache.close()
+    n = len(rows)
+    elapsed = time.time() - start
     lines = []
     def out(s=""):
-        print(s, flush=True)
         lines.append(s)
-
-    out(f"\n=== Generator stage ablation (Stage A / embedding / Stage B judge) ===")
-    out(f"  canonicals={n} | skills={len(skills)} | B={args.judge_budget} | "
-        f"judge={args.judge_model} | reference={ref}")
-    out(f"  elapsed {time.time()-t0:.0f}s\n")
-    out(f"  {'config':<16}{'judge calls/can':>16}{'applicable/can':>16}"
-        f"{'precision':>12}{'recall vs ref':>16}{'appl skills/can':>18}")
-    for a in arms:
-        sent = agg[a]["sent"]
-        appl = agg[a]["applicable"]
-        prec = (appl / sent) if sent else 0.0
-        rec = (agg[a]["ref_hit"] / ref_total) if ref_total else 0.0
-        out(f"  {a:<16}{sent/n:>16.1f}{appl/n:>16.2f}{prec:>12.2f}"
-            f"{rec:>16.2f}{agg[a]['appl_skills']/n:>18.2f}")
-    out("")
-    out("  cost      = judge calls/canonical = pairs an arm SENDS to Stage B (production cost).")
-    out("  precision = applicable / sent (how much judge budget lands on applicable pairs).")
-    out(f"  recall    = applicable pairs also found by the reference ('{ref}'), / reference total.")
-    out("  KEY: full vs struct_randcap = value of the embedding ranker at equal budget;")
-    out("       full vs embed_llm      = value of structural routing;")
-    out("       struct_llm vs full     = applicable pairs lost to capping, and the cost saved.")
-    out(f"\n  trace -> {trace_path}")
-
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"\nwrote {args.out}", flush=True)
+        print(s, flush=True)
+    out("=== MEMETIC E4: budget-matched generator retrieval ablation + sampled recall audit ===")
+    out(f"canonicals={n} | skills={len(skills)} | B={args.judge_budget} | split={split} | seed={args.seed}")
+    out(f"model={args.judge_model} | judge cached={cached_judged} | new API judgements={newly_judged} | elapsed={elapsed/60:.1f}min")
+    out(f"{'arm':<18}{'sent/can':>12}{'appl/can':>12}{'precision':>13}{'skills/can':>13}")
+    for arm in ARMS:
+        sent = sum(r["arms"][arm]["sent"] for r in rows)
+        app = sum(r["arms"][arm]["applicable"] for r in rows)
+        distinct = sum(r["arms"][arm]["applicable_skills"] for r in rows)
+        out(f"{arm:<18}{sent/n:>12.1f}{app/n:>12.2f}{app/sent if sent else float('nan'):>13.3f}{distinct/n:>13.2f}")
+    out("\nPAIRED APPLICABLE-PAIR YIELD (per canonical; task-bootstrap 95% CIs):")
+    for arm in ("struct_randcap", "embed_llm"):
+        mean, lo, hi = bootstrap_paired(rows, "full", arm, seed=args.seed + 1)
+        ci = f"[{lo:.2f}, {hi:.2f}]" if lo is not None else "n=1"
+        out(f"  full minus {arm}: {mean:+.2f} applicable pairs/canonical; 95% bootstrap CI {ci}")
+    known_s = sum(r["audit"]["known_struct_positive"] for r in rows)
+    known_r = sum(r["audit"]["known_rejected_positive"] for r in rows)
+    s_est = sum(r["audit"]["struct_omitted"]["estimated_positive"] for r in rows)
+    r_est = sum(r["audit"]["struct_rejected"]["estimated_positive"] for r in rows)
+    s_var = sum(r["audit"]["struct_omitted"]["estimated_variance"] for r in rows)
+    r_var = sum(r["audit"]["struct_rejected"]["estimated_variance"] for r in rows)
+    total = known_s + known_r + s_est + r_est
+    tot_struct = known_s + s_est
+    full_hits = sum(r["arms"]["full"]["applicable"] for r in rows)
+    out("\nSAMPLED AUDIT (design-based expansion; judge-defined applicability):")
+    out(f"  structurally eligible applicable estimate: {tot_struct:.1f} (observed selected + audit expansion)")
+    out(f"  structurally rejected applicable estimate: {known_r+r_est:.1f} (observed embed-only + audit expansion)")
+    out(f"  total applicable estimate: {total:.1f} from a site x skill universe")
+    if total > 0:
+        est_recall = full_hits / total
+        if math.isfinite(s_var+r_var):
+            se = full_hits * math.sqrt(s_var + r_var) / total**2
+            out(f"  FULL estimated pair recall vs entire universe: {est_recall:.3f} "
+                f"(approx. design SE={se:.3f}; normal 95% [{max(0,est_recall-1.96*se):.3f}, {min(1,est_recall+1.96*se):.3f}])")
+        else:
+            out(f"  FULL estimated pair recall vs entire universe: {est_recall:.3f} (audit too small for SE)")
+        out(f"  structural-stage estimated pair recall: {tot_struct/total:.3f}")
+        out(f"  FULL estimated pair recall within structural survivors: {full_hits/tot_struct:.3f}" if tot_struct else "  no structural positives")
+    out("\nINTERPRETATION: Precision is agreement with the SAME LLM applicability judge, NOT human-labelled precision.")
+    out("Recall is a weighted random-audit estimate, NOT exhaustive recall. Its normal-approximation interval")
+    out("covers sampling error only, not judge errors, prompt bias, or between-task generalisation; small audits can under-cover.")
+    out("Arm cost is the number of pairs that arm would send in isolation; unique API calls above include audits and cache reuse.")
+    out("All models/skills/prompt versions must remain fixed; this experiment does not measure generated-bug quality.")
+    out(f"Per-canonical trace: {out_path}.jsonl")
+    out(f"Pair verdict trace: {out_path}.pairs.jsonl")
+    out(f"Persistent cache: {out_path}.sqlite")
+    out(f"Sampled tasks: {out_path}.tasks.json")
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nREPORT WRITTEN: {out_path}", flush=True)
 
 
 if __name__ == "__main__":
